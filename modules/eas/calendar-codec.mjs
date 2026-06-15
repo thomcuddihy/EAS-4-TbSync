@@ -107,7 +107,7 @@ export function applicationDataToIcal({
       childByTag(adNode, "OrganizerEmail") ||
       childByTag(adNode, "OrganizerName");
     eventLog(
-      "info",
+      "debug",
       `[calendar-codec] receive OrganizerInfo: present=${!!hasOrgInfo} OrganizerEmail=${JSON.stringify(orgEmailRaw ?? null)} OrganizerName=${JSON.stringify(orgNameRaw ?? null)}`,
     );
   }
@@ -500,7 +500,8 @@ export function appendApplicationDataFromIcal({
 
   const dtstart = vevent.getFirstProperty("dtstart");
   const dtend = vevent.getFirstProperty("dtend");
-  const allDay = isAllDayProp(dtstart) && isAllDayProp(dtend);
+  const timing = eventTimingFor(vevent, dtstart, dtend);
+  const allDay = timing.allDay;
   builder.atag("AllDayEvent", allDay ? "1" : "0");
 
   // Body.
@@ -542,7 +543,7 @@ export function appendApplicationDataFromIcal({
     }
     if (eventLog) {
       eventLog(
-        "info",
+        "debug",
         `[calendar-codec] push OrganizerInfo: local ORGANIZER email=${JSON.stringify(localEmail)} cn=${JSON.stringify(localCn)} → emitted OrganizerEmail=${JSON.stringify(emittedEmail)} OrganizerName=${JSON.stringify(emittedName)}`,
       );
     }
@@ -561,7 +562,7 @@ export function appendApplicationDataFromIcal({
   // (`YYYYMMDDT000000Z` from the local-clock date, no TZ conversion) -
   // mirrors legacy `getIsoUtcString(date, false, true, true)` so the
   // user-intended date isn't shifted by ±1 day in non-UTC zones.
-  builder.atag("EndTime", endTimeFor(dtend, asVersion, allDay));
+  builder.atag("EndTime", endTimeFor(timing.end, asVersion, allDay));
 
   // Location.
   const location = stringOf(vevent.getFirstPropertyValue("location"));
@@ -597,7 +598,7 @@ export function appendApplicationDataFromIcal({
 
   // Subject + StartTime.
   builder.atag("Subject", stringOf(vevent.getFirstPropertyValue("summary")));
-  builder.atag("StartTime", startTimeFor(dtstart, asVersion, allDay));
+  builder.atag("StartTime", startTimeFor(timing.start, asVersion, allDay));
 
   // UID (forbidden in 16.1; not inside exceptions either - legacy
   // suppresses UID inside <Exception>, even on 2.5/14.x).
@@ -880,12 +881,56 @@ function nowBasicUtc() {
   return formatBasicUtc(new Date());
 }
 
+function eventTimingFor(vevent, dtstart, dtend) {
+  const start = asIcalTime(dtstart?.getFirstValue());
+  const allDay = isAllDayValue(start) && (!dtend || isAllDayProp(dtend));
+  const duration = vevent.getFirstProperty("duration")?.getFirstValue?.();
+  let end =
+    (dtend ? asIcalTime(dtend.getFirstValue()) : null) ??
+    addDurationToIcalTime(start, duration, defaultDuration(allDay));
+
+  if (!isIcalTimeAfter(end, start)) {
+    end = addDurationToIcalTime(start, null, defaultDuration(allDay));
+  }
+
+  return { start, end, allDay };
+}
+
+function asIcalTime(value) {
+  if (value instanceof ICAL.Time) return value;
+  const date = value ? new Date(value) : new Date();
+  return jsDateToIcalUtcTime(Number.isNaN(date.getTime()) ? new Date() : date);
+}
+
+function defaultDuration(allDay) {
+  return new ICAL.Duration(allDay ? { days: 1 } : { hours: 1 });
+}
+
+function addDurationToIcalTime(start, duration, fallbackDuration) {
+  const d = duration instanceof ICAL.Duration ? duration : fallbackDuration;
+  const end = start.clone();
+  end.addDuration(d);
+  return end;
+}
+
+function isIcalTimeAfter(end, start) {
+  try {
+    return end.toJSDate().getTime() > start.toJSDate().getTime();
+  } catch {
+    return false;
+  }
+}
+
+function itemDateValue(propOrValue) {
+  return propOrValue?.getFirstValue ? propOrValue.getFirstValue() : propOrValue;
+}
+
 /** Read a property's date as `YYYYMMDDT000000Z` from the *local-clock*
  *  year/month/day, with no UTC conversion. Mirrors legacy
  *  `getIsoUtcString(date, false, true, true)` for AS 16.1 all-day. */
-function fakeLocalAsUtcDate(prop) {
-  if (!prop) return nowBasicUtc();
-  const v = prop.getFirstValue();
+function fakeLocalAsUtcDate(propOrValue) {
+  const v = itemDateValue(propOrValue);
+  if (!v) return nowBasicUtc();
   const pad = (n) => String(n).padStart(2, "0");
   if (v instanceof ICAL.Time) {
     return `${v.year}${pad(v.month)}${pad(v.day)}T000000Z`;
@@ -894,19 +939,22 @@ function fakeLocalAsUtcDate(prop) {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T000000Z`;
 }
 
-function startTimeFor(dtstart, asVersion, allDay) {
-  if (asVersion === "16.1" && allDay) return fakeLocalAsUtcDate(dtstart);
-  return dtstart ? toBasicUtc(dtstart.getFirstValue()) : nowBasicUtc();
+function startTimeFor(start, asVersion, allDay) {
+  if (asVersion === "16.1" && allDay) return fakeLocalAsUtcDate(start);
+  return start ? toBasicUtc(itemDateValue(start)) : nowBasicUtc();
 }
 
-function endTimeFor(dtend, asVersion, allDay) {
-  if (asVersion === "16.1" && allDay) return fakeLocalAsUtcDate(dtend);
-  return dtend ? toBasicUtc(dtend.getFirstValue()) : nowBasicUtc();
+function endTimeFor(end, asVersion, allDay) {
+  if (asVersion === "16.1" && allDay) return fakeLocalAsUtcDate(end);
+  return end ? toBasicUtc(itemDateValue(end)) : nowBasicUtc();
 }
 
 function isAllDayProp(prop) {
   if (!prop) return false;
-  const v = prop.getFirstValue();
+  return isAllDayValue(prop.getFirstValue());
+}
+
+function isAllDayValue(v) {
   return v instanceof ICAL.Time && v.isDate;
 }
 

@@ -252,7 +252,7 @@
     "message": "Sync recurring events / tasks and exceptions"
   },
   "config.calendar.syncRecurrence.hint": {
-    "message": "Experimental - off by default. When enabled, recurrence rules and per-instance exceptions round-trip with the server."
+    "message": "When enabled, recurrence rules and per-instance exceptions round-trip with the server. Recommended for Microsoft 365 and Outlook accounts."
   },
   "config.section.gal": {
     "message": "Global Address List"

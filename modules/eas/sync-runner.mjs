@@ -167,6 +167,58 @@ function logRecurrence(ctx, message, details) {
   //});
 }
 
+function reportRejectedPushItem(ctx, operation, status, sentEntry) {
+  const itemId = sentEntry?.entry?.itemId ?? sentEntry?.item?.id ?? "unknown";
+  const localStatus = sentEntry?.entry?.status;
+  const summary = summarizeBlobForLog(
+    sentEntry?.item?.blob,
+    ctx.itemKind.changelogKind,
+  );
+  ctx.provider.reportEventLog({
+    level: "warning",
+    accountId: ctx.accountId,
+    folderId: ctx.folderId,
+    message:
+      `[${ctx.itemKind.changelogKind}-sync] server rejected ${operation} for ` +
+      `local item ${itemId}` +
+      (localStatus ? ` (${localStatus})` : "") +
+      ` (Status ${status ?? "unknown"})` +
+      (summary ? `: ${summary}` : ""),
+  });
+}
+
+function summarizeBlobForLog(blob, kind) {
+  if (typeof blob !== "string" || !blob) return "";
+  const target = roundTripTargetFor(kind);
+  if (!target) return "";
+  try {
+    const comp = new ICAL.Component(ICAL.parse(blob));
+    const inner = target.inner ? comp.getFirstSubcomponent(target.inner) : comp;
+    if (!inner) return "";
+    const fields =
+      kind === "contact"
+        ? ["fn", "n", "email"]
+        : ["summary", "dtstart", "dtend", "due", "uid"];
+    const parts = [];
+    for (const name of fields) {
+      const value = inner.getFirstPropertyValue(name);
+      if (value != null && String(value) !== "") {
+        parts.push(`${name.toUpperCase()}=${truncateForLog(String(value))}`);
+      }
+    }
+    return parts.join(" ");
+  } catch {
+    return "";
+  }
+}
+
+function truncateForLog(value, max = 80) {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  return singleLine.length > max
+    ? `${singleLine.slice(0, Math.max(0, max - 3))}...`
+    : singleLine;
+}
+
 /** Pull WindowSize + initial push batch size. Migrated from the legacy
  *  `extensions.eas4tbsync.maxitems` pref (default 50) into
  *  `browser.storage.local["maxItems"]`; default 25 when unset. */
@@ -608,6 +660,167 @@ async function revertLocalChanges(ctx) {
   return false;
 }
 
+async function tryRestoreRejectedCalendarItem(
+  ctx,
+  operation,
+  status,
+  sentEntry,
+  restoredItems = null,
+) {
+  const entry = sentEntry?.entry;
+  if (status !== STATUS_INVALID) return false;
+  if (
+    !entry ||
+    (entry.status !== "modified_by_user" && entry.status !== "deleted_by_user")
+  ) {
+    return false;
+  }
+  if (ctx.itemKind.changelogKind !== "event") return false;
+  if (!easCommandLikelyAvailable(ctx.account, "ItemOperations")) return false;
+  if (restoredItems?.has(entry.itemId)) return true;
+
+  const serverID = await resolveServerIdForRejectedEntry(
+    ctx,
+    entry,
+    sentEntry?.serverID,
+  );
+  if (!serverID) return false;
+
+  let properties = null;
+  try {
+    properties = await fetchServerItem({
+      account: ctx.account,
+      asVersion: ctx.asVersion,
+      collectionId: ctx.collectionId,
+      serverID,
+    });
+  } catch (err) {
+    ctx.provider.reportEventLog({
+      level: "debug",
+      accountId: ctx.accountId,
+      folderId: ctx.folderId,
+      message: `[event-sync] rejected edit restore fetch failed for ${entry.itemId}: ${err?.message ?? String(err)}`,
+    });
+    return false;
+  }
+  if (!properties) return false;
+
+  const blob = await ctx.itemKind.codec.applicationDataToBlob({
+    adNode: properties,
+    serverID,
+    asVersion: ctx.asVersion,
+    separator: ctx.separator,
+    defaultTimezone: ctx.defaultTimezone,
+    syncRecurrence: ctx.syncRecurrence,
+    msTodoCompat: ctx.msTodoCompat,
+    uid: entry.itemId,
+    userEmail: ctx.account?.custom?.user,
+    eventLog: ctx.eventLog,
+  });
+
+  const received = isReceivedMeetingBlob(blob, ctx.account?.custom?.user);
+
+  await ctx.provider.changelogMarkServerWrite({
+    accountId: ctx.accountId,
+    folderId: ctx.folderId,
+    parentId: ctx.targetID,
+    itemId: entry.itemId,
+    status: "modified_by_server",
+    kind: ctx.itemKind.changelogKind,
+  });
+  await restoreLocalBlob(ctx, entry.itemId, blob);
+  upsertIndexMap(ctx, entry.itemId, serverID);
+  await ctx.provider.changelogRemove({
+    accountId: ctx.accountId,
+    folderId: ctx.folderId,
+    parentId: entry.parentId,
+    itemId: entry.itemId,
+  });
+  restoredItems?.add(entry.itemId);
+
+  const summary = summarizeBlobForLog(blob, ctx.itemKind.changelogKind);
+  ctx.provider.reportEventLog({
+    level: "warning",
+    accountId: ctx.accountId,
+    folderId: ctx.folderId,
+    message:
+      `[event-sync] server rejected ${operation} for ` +
+      `${received ? "received meeting" : "calendar item"}; ` +
+      `restored server copy and cleared local edit (Status ${status})` +
+      (summary ? `: ${summary}` : ""),
+  });
+  return true;
+}
+
+async function resolveServerIdForRejectedEntry(ctx, entry, serverID) {
+  let resolved = serverID || findServerIdByUid(ctx, entry.itemId);
+  if (!resolved && entry.status === "modified_by_user") {
+    try {
+      const it = await ctx.store.get(entry.itemId);
+      if (it?.blob) {
+        resolved = ctx.itemKind.codec.readEasServerIdFromBlob(it.blob);
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  return resolved;
+}
+
+async function restoreLocalBlob(ctx, itemId, blob) {
+  let existing = null;
+  try {
+    existing = await ctx.store.get(itemId);
+  } catch {
+    existing = null;
+  }
+  if (existing?.blob) {
+    await ctx.store.update(itemId, blob);
+    return;
+  }
+  const createdId = await ctx.store.create(itemId, blob);
+  if (createdId !== itemId) {
+    throw new Error(
+      `rejected edit restore: store.create id mismatch: expected ${itemId}, got ${createdId}`,
+    );
+  }
+}
+
+function isReceivedMeetingBlob(blob, userEmail) {
+  if (typeof blob !== "string" || !blob) return false;
+  const userEmailLower = normalizeEmail(userEmail);
+  if (!userEmailLower) return false;
+  try {
+    const comp = new ICAL.Component(ICAL.parse(blob));
+    const vevent =
+      comp.name === "vevent" ? comp : comp.getFirstSubcomponent("vevent");
+    if (!vevent) return false;
+    const attendees = vevent.getAllProperties("attendee");
+    const hasSelfAttendee = attendees.some(
+      (a) => normalizeEmail(a.getFirstValue()) === userEmailLower,
+    );
+    if (!hasSelfAttendee) return false;
+    const organizerEmail = normalizeEmail(
+      vevent.getFirstProperty("organizer")?.getFirstValue(),
+    );
+    if (organizerEmail) return organizerEmail !== userEmailLower;
+    const meetingStatus = parseInt(
+      String(vevent.getFirstPropertyValue("x-eas-meetingstatus") ?? ""),
+      10,
+    );
+    return !!(meetingStatus & 0x2);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeEmail(value) {
+  return String(value ?? "")
+    .replace(/^mailto:/i, "")
+    .trim()
+    .toLowerCase();
+}
+
 async function finishWith(ctx, result) {
   if (!ctx.syncKeyDirty && !ctx.indexMapDirty) return result;
   const patch = {};
@@ -784,12 +997,30 @@ async function pushPhase(ctx, userEdits) {
         pending = slice.concat(pending);
         continue;
       }
+      const sentEntry =
+        built.adds.find((a) => a.entry === slice[0]) ??
+        built.mods.find((m) => m.entry === slice[0]) ??
+        built.dels.find((d) => d.entry === slice[0]) ??
+        null;
+      const restored = await tryRestoreRejectedCalendarItem(
+        ctx,
+        "single-item batch",
+        r.collStatus,
+        sentEntry,
+      );
+      if (restored) {
+        changedAnything = true;
+        itemsDone += 1;
+        reportProgress(ctx, itemsDone, itemsTotal);
+        continue;
+      }
       failedItems.add(slice[0].itemId);
-      ctx.provider.reportEventLog({
-        level: "warning",
-        accountId: ctx.accountId,
-        folderId: ctx.folderId,
-        message: `[${ctx.itemKind.changelogKind}-sync] dropping item ${slice[0].itemId} after Status ${r.collStatus} on a single-item batch`,
+      reportRejectedPushItem(ctx, "single-item batch", r.collStatus, {
+        entry: slice[0],
+        item:
+          built.adds.find((a) => a.entry === slice[0])?.item ??
+          built.mods.find((m) => m.entry === slice[0])?.item ??
+          null,
       });
       itemsDone += 1;
       reportProgress(ctx, itemsDone, itemsTotal);
@@ -923,6 +1154,7 @@ async function buildPushBatch(ctx, slice) {
 
 async function applyResponses(ctx, responses, sent, failedItems, opts = {}) {
   const { hadResponsesElement = true } = opts;
+  const restoredItems = new Set();
   if (!hadResponsesElement) {
     const sentCount = sent.adds.length + sent.mods.length + sent.dels.length;
     ctx.provider.reportEventLog({
@@ -944,6 +1176,7 @@ async function applyResponses(ctx, responses, sent, failedItems, opts = {}) {
       // pushPhase will move the changelog entry behind the good ones
       // for the next sync.
       failedItems.add(sentEntry.entry.itemId);
+      reportRejectedPushItem(ctx, "add", status, sentEntry);
       continue;
     }
     const stamped = ctx.itemKind.codec.stampEasServerId(
@@ -995,7 +1228,18 @@ async function applyResponses(ctx, responses, sent, failedItems, opts = {}) {
     // see the non-OK status and skip the changelog removal.
     const serverId = readPathFrom(node, ["ServerId"]);
     const sentEntry = sent.mods.find((m) => m.serverID === serverId);
-    if (sentEntry) failedItems.add(sentEntry.entry.itemId);
+    if (sentEntry) {
+      const restored = await tryRestoreRejectedCalendarItem(
+        ctx,
+        "change",
+        status,
+        sentEntry,
+        restoredItems,
+      );
+      if (restored) continue;
+      failedItems.add(sentEntry.entry.itemId);
+      reportRejectedPushItem(ctx, "change", status, sentEntry);
+    }
   }
   for (const node of responses.deletes) {
     const status = readPathFrom(node, ["Status"]);
@@ -1010,9 +1254,19 @@ async function applyResponses(ctx, responses, sent, failedItems, opts = {}) {
         itemId: sentEntry.entry.itemId,
       });
       removeFromIndexMap(ctx, sentEntry.entry.itemId);
+    } else {
+      const restored = await tryRestoreRejectedCalendarItem(
+        ctx,
+        "delete",
+        status,
+        sentEntry,
+        restoredItems,
+      );
+      if (!restored) {
+        failedItems.add(sentEntry.entry.itemId);
+        reportRejectedPushItem(ctx, "delete", status, sentEntry);
+      }
     }
-    // Other delete failures are not tracked - legacy didn't either
-    // ("What can we do about failed deletes? SyncLog" - sync.js:1073).
   }
   for (const m of sent.mods) {
     const ack = responses.changes.find(
