@@ -24,12 +24,21 @@ import {
   easTypeToFolderType,
   finalizeFolderListForPush,
   iconForServerType,
+  serverUrlForServerType,
 } from "./eas-provider.mjs";
 import * as calendarStore from "./calendar-store.mjs";
 import * as eventCodec from "./eas/calendar-codec.mjs";
 import * as taskCodec from "./eas/task-codec.mjs";
 
 const UPGRADE_QUEUE_KEY = "eas.upgradeQueue";
+const LEGACY_MIGRATION_UPGRADE_ID = "eas.legacy-migration";
+const LEGACY_FRESH_INSTALL_REPAIR_KEY = "eas.legacyFreshInstallRepairDone";
+const MICROSOFT_RECURRENCE_REPAIR_KEY = "eas.microsoftRecurrenceRepairDone";
+const MICROSOFT_EAS_HOSTS = new Set([
+  "outlook.office365.com",
+  "outlook.office.com",
+  "eas.outlook.com",
+]);
 
 /** Coerce the legacy `Map<uid, serverId>` JSON shape into the new array
  *  of `{uid, serverId}` records. Returns a fresh array — caller is free
@@ -48,7 +57,7 @@ function buildIndexMap(value) {
 export const UPGRADES = [
   {
     splitVersion: "4.20",
-    id: "eas.legacy-migration",
+    id: LEGACY_MIGRATION_UPGRADE_ID,
     run: async (provider) => {
       const PREF_MIGRATIONS = [
         {
@@ -90,6 +99,7 @@ export const UPGRADES = [
         try {
           await liftHostAndHttpsToServer(provider, acc);
           await liftCredentials(provider, acc);
+          await normalizeMicrosoftProtocolSelection(provider, acc);
           await normalizeAllowedEasCommands(provider, acc);
           await fixFolders(provider, acc);
         } catch (err) {
@@ -177,6 +187,8 @@ export function compareVersions(a, b) {
 }
 
 let inFlight = null;
+let legacyRepairInFlight = null;
+let microsoftRecurrenceRepairInFlight = null;
 
 /** Drain `eas.upgradeQueue` against the UPGRADES table. Idempotent
  *  (each upgrade body is itself idempotent) and self-coalescing - a
@@ -249,6 +261,165 @@ export function runUpgrades(provider) {
     }
   })();
   return inFlight;
+}
+
+/** Fresh installs do not get an update transition, but the TbSync host may
+ *  already have migrated legacy EAS rows before this provider first connects.
+ *  Repair that state once by running the same idempotent provider-specific
+ *  migration used by update installs. */
+export function runLegacyMigrationRepair(provider) {
+  if (legacyRepairInFlight) return legacyRepairInFlight;
+
+  legacyRepairInFlight = (async () => {
+    let lockAcquired = false;
+    try {
+      const rv = await browser.storage.local.get({
+        [LEGACY_FRESH_INSTALL_REPAIR_KEY]: false,
+      });
+      const alreadyRepaired = !!rv[LEGACY_FRESH_INSTALL_REPAIR_KEY];
+      const accounts = await provider.listAccounts();
+      if (!accounts.length) return;
+
+      const needsAccountRepair = accounts.some(
+        needsLegacyMigrationAccountRepair,
+      );
+      if (alreadyRepaired && !needsAccountRepair) return;
+
+      await provider.setProviderUpgradeLock(true);
+      lockAcquired = true;
+      provider.reportEventLog({
+        level: "debug",
+        message: `[upgrade] repairing legacy migration state for ${accounts.length} account(s)`,
+      });
+
+      const upgrade = UPGRADES.find(
+        (u) => u.id === LEGACY_MIGRATION_UPGRADE_ID,
+      );
+      await upgrade.run(provider);
+
+      const refreshed = await provider.listAccounts();
+      if (refreshed.some(needsLegacyMigrationAccountRepair)) {
+        provider.reportEventLog({
+          level: "warning",
+          message:
+            "[upgrade] legacy migration repair left one or more accounts with incomplete connection state",
+        });
+        return;
+      }
+
+      await browser.storage.local.set({
+        [LEGACY_FRESH_INSTALL_REPAIR_KEY]: true,
+      });
+      provider.reportEventLog({
+        level: "debug",
+        message: "[upgrade] legacy migration repair done",
+      });
+    } catch (err) {
+      provider.reportEventLog({
+        level: "warning",
+        message: `[upgrade] legacy migration repair failed: ${err?.message ?? String(err)}`,
+      });
+    } finally {
+      if (lockAcquired) {
+        await provider
+          .setProviderUpgradeLock(false)
+          .catch((err) =>
+            console.warn(
+              "[eas-4-tbsync] failed to release legacy repair lock:",
+              err?.message ?? String(err),
+            ),
+          );
+      }
+      legacyRepairInFlight = null;
+    }
+  })();
+
+  return legacyRepairInFlight;
+}
+
+/** Recurrence support is now stable enough for Microsoft EAS accounts and is
+ *  required for ongoing recurring meetings to appear in Thunderbird. Enable it
+ *  once for existing migrated Office 365 / Outlook accounts, but do not fight
+ *  future user changes. */
+export function runMicrosoftRecurrenceRepair(provider) {
+  if (microsoftRecurrenceRepairInFlight) return microsoftRecurrenceRepairInFlight;
+
+  microsoftRecurrenceRepairInFlight = (async () => {
+    let lockAcquired = false;
+    try {
+      const rv = await browser.storage.local.get({
+        [MICROSOFT_RECURRENCE_REPAIR_KEY]: false,
+      });
+      if (rv[MICROSOFT_RECURRENCE_REPAIR_KEY]) return;
+
+      const accounts = await provider.listAccounts();
+      const targets = accounts.filter(
+        (acc) =>
+          isMicrosoftAccount(acc.custom ?? {}) &&
+          acc.custom?.syncrecurrence !== true,
+      );
+      if (!targets.length) {
+        await browser.storage.local.set({
+          [MICROSOFT_RECURRENCE_REPAIR_KEY]: true,
+        });
+        return;
+      }
+
+      await provider.setProviderUpgradeLock(true);
+      lockAcquired = true;
+      for (const acc of targets) {
+        await provider.updateAccount({
+          accountId: acc.accountId,
+          patch: { custom: { syncrecurrence: true } },
+        });
+        await resetCalendarFolderSyncKeys(provider, acc.accountId);
+        provider.reportEventLog({
+          level: "info",
+          accountId: acc.accountId,
+          message:
+            "[upgrade] enabled recurring event/task synchronization for Microsoft EAS account",
+        });
+      }
+      await browser.storage.local.set({
+        [MICROSOFT_RECURRENCE_REPAIR_KEY]: true,
+      });
+    } catch (err) {
+      provider.reportEventLog({
+        level: "warning",
+        message: `[upgrade] Microsoft recurrence repair failed: ${err?.message ?? String(err)}`,
+      });
+    } finally {
+      if (lockAcquired) {
+        await provider.setProviderUpgradeLock(false).catch((err) =>
+          console.warn(
+            "[eas-4-tbsync] failed to release recurrence repair lock:",
+            err?.message ?? String(err),
+          ),
+        );
+      }
+      microsoftRecurrenceRepairInFlight = null;
+    }
+  })();
+
+  return microsoftRecurrenceRepairInFlight;
+}
+
+async function resetCalendarFolderSyncKeys(provider, accountId) {
+  const rv = await provider.getAccount(accountId);
+  const folders = rv?.folders ?? [];
+  const targets = folders.filter(
+    (f) =>
+      f.selected &&
+      (f.targetType === "calendars" || f.targetType === "tasks") &&
+      f.custom?.synckey !== "0",
+  );
+  for (const folder of targets) {
+    await provider.updateFolder({
+      accountId,
+      folderId: folder.folderId,
+      patch: { custom: { synckey: "0" } },
+    });
+  }
 }
 
 /** Compute the set of upgrades triggered by an update transition and
@@ -357,13 +528,15 @@ async function liftAccountIcon(provider, acc) {
 
 async function liftHostAndHttpsToServer(provider, acc) {
   if (acc.custom?.server) return;
-  const host = acc.custom?.host;
-  if (!host) return;
-  const protocol = acc.custom?.https ? "https://" : "http://";
-  let url = protocol + host;
-  while (url.endsWith("/")) url = url.slice(0, -1);
-  if (!url.endsWith("Microsoft-Server-ActiveSync"))
-    url += "/Microsoft-Server-ActiveSync";
+  const url = legacyServerUrlFromAccount(acc);
+  if (!url) {
+    provider.reportEventLog({
+      level: "warning",
+      accountId: acc.accountId,
+      message: "[upgrade] cannot lift legacy server URL: missing host/servertype",
+    });
+    return;
+  }
   await provider.updateAccount({
     accountId: acc.accountId,
     patch: { custom: { server: url, host: null, https: null } },
@@ -371,8 +544,125 @@ async function liftHostAndHttpsToServer(provider, acc) {
   provider.reportEventLog({
     level: "debug",
     accountId: acc.accountId,
-    message: `[upgrade] lifted legacy host+https to server="${url}"`,
+    message: `[upgrade] lifted legacy host/servertype to server="${url}"`,
   });
+}
+
+function needsLegacyMigrationAccountRepair(acc) {
+  const c = acc.custom ?? {};
+  if (!c || typeof c !== "object") return false;
+
+  if (!c.server && (c.host || c.servertype || c.user)) return true;
+  if (c.host != null || c.https != null) return true;
+  if (typeof c.allowedEasCommands === "string") return true;
+
+  const isMicrosoft = isMicrosoftAccount(c);
+  const isOAuth = c.servertype === "office365" || c.servertype === "personal-ms";
+  if (
+    isMicrosoft &&
+    (isFixedLegacyMicrosoftProtocol(c.asversionselected) ||
+      microsoftProtocolNeedsRefresh(c))
+  ) {
+    return true;
+  }
+  if (isOAuth && !c.refreshToken && c.user) return true;
+  if (!isOAuth && !c.password && c.user) return true;
+
+  return false;
+}
+
+async function normalizeMicrosoftProtocolSelection(provider, acc) {
+  const c = acc.custom ?? {};
+  if (!isMicrosoftAccount(c)) return;
+  if (
+    !isFixedLegacyMicrosoftProtocol(c.asversionselected) &&
+    !microsoftProtocolNeedsRefresh(c)
+  ) {
+    return;
+  }
+
+  await provider.updateAccount({
+    accountId: acc.accountId,
+    patch: {
+      custom: {
+        asversionselected: "auto",
+        asversion: "",
+        allowedEasVersions: [],
+        lastEasOptionsUpdate: 0,
+      },
+    },
+  });
+  provider.reportEventLog({
+    level: "debug",
+    accountId: acc.accountId,
+    message:
+      "[upgrade] reset fixed Microsoft ActiveSync version selection to auto",
+  });
+}
+
+function isFixedLegacyMicrosoftProtocol(value) {
+  return value === "2.5" || value === "14.0" || value === "14.1";
+}
+
+function microsoftProtocolNeedsRefresh(custom) {
+  const allowed = Array.isArray(custom?.allowedEasVersions)
+    ? custom.allowedEasVersions
+    : [];
+  if (!custom?.asversion || custom.asversion === "16.1") return false;
+  return allowed.length === 0 || allowed.includes("16.1");
+}
+
+function isMicrosoftAccount(custom) {
+  if (custom?.servertype === "office365" || custom?.servertype === "personal-ms") {
+    return true;
+  }
+  return MICROSOFT_EAS_HOSTS.has(hostnameFromUrl(custom?.server));
+}
+
+function hostnameFromUrl(value) {
+  try {
+    return new URL(String(value ?? "")).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function legacyServerUrlFromAccount(acc) {
+  const c = acc.custom ?? {};
+  const fixedUrl = serverUrlForServerType(c.servertype);
+  if (fixedUrl) return fixedUrl;
+
+  const host =
+    c.host ?? c.serverHost ?? c.serverhost ?? c.easHost ?? c.hostname ?? "";
+  if (!host) return "";
+  return normalizeLegacyServerUrl(host, c.https);
+}
+
+function normalizeLegacyServerUrl(host, httpsValue) {
+  let url = String(host ?? "").trim();
+  if (!url) return "";
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+    const protocol = legacyHttpsEnabled(httpsValue) ? "https" : "http";
+    url = `${protocol}://${url}`;
+  }
+  while (url.endsWith("/")) url = url.slice(0, -1);
+  if (!/\/Microsoft-Server-ActiveSync$/i.test(url)) {
+    url += "/Microsoft-Server-ActiveSync";
+  }
+  return url;
+}
+
+function legacyHttpsEnabled(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (!v || v === "0" || v === "false" || v === "no" || v === "off") {
+      return false;
+    }
+    return true;
+  }
+  return !!value;
 }
 
 async function liftCredentials(provider, acc) {

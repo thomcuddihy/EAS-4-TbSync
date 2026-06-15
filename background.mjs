@@ -1,7 +1,12 @@
 import { EasProvider } from "./modules/eas-provider.mjs";
 import { startAuth } from "./modules/eas/oauth.mjs";
 import { discoverEasServer } from "./modules/eas/autodiscover.mjs";
-import { runUpgrades, enqueueUpgradesForUpdate } from "./modules/upgrades.mjs";
+import {
+  runUpgrades,
+  enqueueUpgradesForUpdate,
+  runLegacyMigrationRepair,
+  runMicrosoftRecurrenceRepair,
+} from "./modules/upgrades.mjs";
 import { installAnchorMailboxInjector } from "./modules/anchor-mailbox.mjs";
 
 /**
@@ -141,4 +146,8 @@ browser.runtime.onInstalled.addListener(async (details) => {
 // failed mid-flight, the queue persists in storage and we need a second,
 // independent trigger to retry. `runUpgrades` is idempotent + self-
 // coalescing, so a same-boot collision with the listener above is safe.
-providerReady.then(() => runUpgrades(provider));
+providerReady.then(async () => {
+  await runUpgrades(provider);
+  await runLegacyMigrationRepair(provider);
+  await runMicrosoftRecurrenceRepair(provider);
+});

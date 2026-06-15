@@ -76,6 +76,8 @@ export async function runFolderSync({ account, asVersion }) {
     );
     err.code = ERR.UNKNOWN_COMMAND;
     err.folderSyncStatus = status;
+    err.easCommand = "FolderSync";
+    err.easAsVersion = asVersion ?? null;
     throw err;
   }
 

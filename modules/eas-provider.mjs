@@ -1,6 +1,6 @@
 /**
  * EAS provider. Implements the TbSync provider contract for Exchange
- * ActiveSync servers using basic-auth + WBXML (no OAuth for now).
+ * ActiveSync servers using basic-auth or Microsoft OAuth + WBXML.
  *
  * Host owns all persistent state. Account `custom` carries:
  *   - server       - full EAS endpoint URL
@@ -37,7 +37,12 @@ import {
 import * as addressBook from "./address-book.mjs";
 import * as calendarStore from "./calendar-store.mjs";
 import { DEBUG_STATUS_DELAY_MS } from "./debug.mjs";
-import { primeAuth, isOAuthAccount } from "./eas/oauth.mjs";
+import {
+  primeAuth,
+  primeAccessToken,
+  isOAuthAccount,
+  startAuth,
+} from "./eas/oauth.mjs";
 import { negotiateAsVersion } from "./eas/connect.mjs";
 import { discoverEasServer } from "./eas/autodiscover.mjs";
 import {
@@ -48,7 +53,7 @@ import {
 import { runFolderSync } from "./eas/folder-sync.mjs";
 import { syncContactFolder } from "./eas/contact-sync.mjs";
 import { syncCalendarFolder, syncTaskFolder } from "./eas/calendar-sync.mjs";
-import { sendDeviceInformation } from "./eas/settings.mjs";
+import { SETTINGS_ERR, sendDeviceInformation } from "./eas/settings.mjs";
 import { runGalSearch as runGalSearchRequest } from "./eas/gal-search.mjs";
 import { NET_ERR } from "./network.mjs";
 import {
@@ -63,6 +68,8 @@ import { setEventLogSink } from "./eas-event-log.mjs";
 /** EAS FolderSync status codes that indicate the server wants us to run
  *  Provision (in-band equivalent of the HTTP-449 path). */
 const PROVISION_REQUIRED_STATUSES = new Set(["141", "142", "143", "144"]);
+const PROTOCOL_VERSION_REJECTED_STATUS = "138";
+const AS_VERSION_FALLBACK_ORDER = ["16.1", "14.1", "14.0", "2.5"];
 
 /** Re-run OPTIONS once a day so we pick up server-side changes to the
  *  advertised version / command list (legacy used the same window -
@@ -90,6 +97,11 @@ const HOST_BY_SERVERTYPE = {
   office365: "outlook.office365.com",
   "personal-ms": "eas.outlook.com",
 };
+
+export function serverUrlForServerType(servertype) {
+  const host = HOST_BY_SERVERTYPE[servertype];
+  return host ? `https://${host}/Microsoft-Server-ActiveSync` : "";
+}
 
 /** Setup-type → per-account icon override. Sent to TbSync at register
  *  time so the manager's accounts list shows a flavour-specific icon
@@ -251,6 +263,46 @@ export class EasProvider extends TbSyncProviderImplementation {
     return null;
   }
 
+  async onReauthenticate({ accountId }) {
+    const ctx = await this.#loadContext(accountId);
+    if (!ctx) throw withCode(new Error("Unknown account"), ERR.UNKNOWN_ACCOUNT);
+    const c = ctx.account.custom ?? {};
+    if (!isOAuthAccount(c)) {
+      throw withCode(
+        new Error("This account does not use Microsoft OAuth"),
+        ERR.AUTH,
+      );
+    }
+
+    const tokens = await startAuth({
+      loginHint: c.authenticatedUserEmail || c.user || "",
+      servertype: c.servertype,
+      onPopupOpened: (popup) => this.registerReauthWindow(accountId, popup?.id),
+      onPopupClosed: () => this.unregisterReauthWindow(accountId),
+    });
+
+    const authenticatedUserEmail =
+      tokens.authenticatedUserEmail ?? c.authenticatedUserEmail ?? null;
+    await this.updateAccount({
+      accountId,
+      patch: {
+        custom: {
+          refreshToken: tokens.refreshToken,
+          authenticatedUserEmail,
+          user: authenticatedUserEmail || c.user || "",
+        },
+      },
+    });
+    primeAuth(accountId, {
+      refreshToken: tokens.refreshToken,
+      servertype: c.servertype,
+    });
+    if (tokens.accessToken) {
+      primeAccessToken(accountId, tokens.accessToken, tokens.expiresIn);
+    }
+    return null;
+  }
+
   async onRegisterSuccessful({ accountId }) {
     // OPTIONS probe up-front so the manager UI / config popup have the
     // server-advertised EAS version and command list (notably Search/GAL)
@@ -342,10 +394,26 @@ export class EasProvider extends TbSyncProviderImplementation {
     accountId,
     redirectsRemaining = 1,
     rediscoversRemaining = 1,
+    versionFallbacksRemaining = 3,
   ) {
     try {
       await this.#doConnectAndDiscover(accountId);
     } catch (err) {
+      if (
+        isProtocolVersionRejected(err) &&
+        versionFallbacksRemaining > 0
+      ) {
+        const switched = await this.#switchRejectedAsVersion(accountId, err);
+        if (switched) {
+          await this.#connectAndDiscoverFolders(
+            accountId,
+            redirectsRemaining,
+            rediscoversRemaining,
+            versionFallbacksRemaining - 1,
+          );
+          return;
+        }
+      }
       if (
         err.code === NET_ERR.HOST_REDIRECT &&
         err.newLocation &&
@@ -359,6 +427,7 @@ export class EasProvider extends TbSyncProviderImplementation {
           accountId,
           redirectsRemaining - 1,
           rediscoversRemaining,
+          versionFallbacksRemaining,
         );
         return;
       }
@@ -369,6 +438,7 @@ export class EasProvider extends TbSyncProviderImplementation {
             accountId,
             redirectsRemaining,
             rediscoversRemaining - 1,
+            versionFallbacksRemaining,
           );
           return;
         }
@@ -409,6 +479,51 @@ export class EasProvider extends TbSyncProviderImplementation {
       level: "debug",
       accountId,
       message: `[autodiscover] rotated server URL: ${c.server} -> ${newUrl}`,
+    });
+    return true;
+  }
+
+  async #switchRejectedAsVersion(accountId, err) {
+    const ctx = await this.#loadContext(accountId);
+    const c = ctx?.account?.custom ?? {};
+    const rejectedVersion = err.easAsVersion || currentAsVersion(c);
+    const rejected = new Set(
+      Array.isArray(c.rejectedAsVersions) ? c.rejectedAsVersions : [],
+    );
+    if (rejectedVersion) rejected.add(rejectedVersion);
+
+    const allowed = Array.isArray(c.allowedEasVersions)
+      ? c.allowedEasVersions
+      : [];
+    const nextVersion = AS_VERSION_FALLBACK_ORDER.find((v) => {
+      if (rejected.has(v)) return false;
+      return allowed.length === 0 || allowed.includes(v);
+    });
+    if (!nextVersion) {
+      this.reportEventLog({
+        level: "warning",
+        accountId,
+        message: `[eas:version] ${err.easCommand ?? "request"} rejected AS ${rejectedVersion || "unknown"} with Status=${PROTOCOL_VERSION_REJECTED_STATUS}; no fallback version remains`,
+      });
+      return false;
+    }
+
+    await this.updateAccount({
+      accountId,
+      patch: {
+        custom: {
+          asversion: nextVersion,
+          asversionselected: "auto",
+          foldersynckey: "0",
+          rejectedAsVersions: [...rejected],
+          deviceInformationUnsupported: null,
+        },
+      },
+    });
+    this.reportEventLog({
+      level: "warning",
+      accountId,
+      message: `[eas:version] ${err.easCommand ?? "request"} rejected AS ${rejectedVersion || "unknown"} with Status=${PROTOCOL_VERSION_REJECTED_STATUS}; retrying with AS ${nextVersion}`,
     });
     return true;
   }
@@ -469,7 +584,10 @@ export class EasProvider extends TbSyncProviderImplementation {
       );
     }
     const asVersion =
-      selected === "auto" ? ctx.account.custom.asversion : selected;
+      selected === "auto"
+        ? ctx.account.custom.asversion ||
+          firstAllowedAsVersion(ctx.account.custom.allowedEasVersions)
+        : selected;
 
     // 2) Pre-emptive Provision (legacy "Kerio" semantics). When the
     // user has flipped the toggle on - or a previous 449 stuck it on -
@@ -552,7 +670,12 @@ export class EasProvider extends TbSyncProviderImplementation {
     // 6) Persist the new FolderSync continuation key.
     await this.updateAccount({
       accountId,
-      patch: { custom: { foldersynckey: syncResult.synckey } },
+      patch: {
+        custom: {
+          foldersynckey: syncResult.synckey,
+          rejectedAsVersions: [],
+        },
+      },
     });
   }
 
@@ -644,8 +767,22 @@ export class EasProvider extends TbSyncProviderImplementation {
     // 14.1/16.0/16.1 carry DeviceInformation inside the initial
     // Provision body and forbid the separate Settings command for it.
     if (PROVISION_EMBEDS_DEVICE_INFO.has(asVersion)) return;
+    if (account.custom?.deviceInformationUnsupported === true) return;
     if (!easCommandAdvertised(account, "Settings")) return;
-    await sendDeviceInformation({ account, asVersion });
+    try {
+      await sendDeviceInformation({ account, asVersion });
+    } catch (err) {
+      if (err?.code !== SETTINGS_ERR.REJECTED) throw err;
+      await this.updateAccount({
+        accountId: account.accountId,
+        patch: { custom: { deviceInformationUnsupported: true } },
+      }).catch(() => {});
+      this.reportEventLog({
+        level: "warning",
+        accountId: account.accountId,
+        message: `[settings] DeviceInformation rejected by server (Status=${err.settingsStatus ?? "missing"}); continuing without it`,
+      });
+    }
   }
 
   /** GAL contact lookup with provision-then-retry recovery. Loaded by
@@ -780,7 +917,7 @@ export class EasProvider extends TbSyncProviderImplementation {
     if (servertype === "office365" || servertype === "personal-ms") {
       const { refreshToken, authenticatedUserEmail } = args;
       if (!refreshToken) throw new Error("OAuth refresh token is required");
-      const server = `https://${HOST_BY_SERVERTYPE[servertype]}/Microsoft-Server-ActiveSync`;
+      const server = serverUrlForServerType(servertype);
       const user = authenticatedUserEmail || args.loginHint || "";
       return {
         accountName: trimmedLabel,
@@ -805,7 +942,7 @@ export class EasProvider extends TbSyncProviderImplementation {
           // is a pre-emptive override for servers that need provisioning
           // but don't return 449 (e.g. Kerio).
           provision: false,
-          syncrecurrence: false,
+          syncrecurrence: true,
         },
       };
     }
@@ -831,7 +968,7 @@ export class EasProvider extends TbSyncProviderImplementation {
           policykey: "0",
           foldersynckey: "0",
           provision: false,
-          syncrecurrence: false,
+          syncrecurrence: true,
         },
       };
     }
@@ -860,7 +997,7 @@ export class EasProvider extends TbSyncProviderImplementation {
         policykey: "0",
         foldersynckey: "0",
         provision: false,
-        syncrecurrence: false,
+        syncrecurrence: true,
       },
     };
   }
@@ -1022,6 +1159,27 @@ export class EasProvider extends TbSyncProviderImplementation {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+function isProtocolVersionRejected(err) {
+  return (
+    err?.folderSyncStatus === PROTOCOL_VERSION_REJECTED_STATUS ||
+    err?.settingsStatus === PROTOCOL_VERSION_REJECTED_STATUS
+  );
+}
+
+function currentAsVersion(custom) {
+  const selected = custom?.asversionselected || "auto";
+  return selected === "auto" ? custom?.asversion || "" : selected;
+}
+
+function firstAllowedAsVersion(allowedVersions) {
+  const allowed = Array.isArray(allowedVersions) ? allowedVersions : [];
+  return (
+    AS_VERSION_FALLBACK_ORDER.find(
+      (v) => allowed.length === 0 || allowed.includes(v),
+    ) || "16.1"
+  );
+}
 
 async function safeDeleteTarget(folder) {
   try {

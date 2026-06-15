@@ -123,12 +123,19 @@ export function primeAccessToken(accountId, token, expiresIn) {
 /**
  * Open the Microsoft consent popup and return the resulting tokens.
  *
- *   loginHint   pre-selects an account on the consent screen
- *   servertype  "office365" | "personal-ms" - drives scope
+ *   loginHint      pre-selects an account on the consent screen
+ *   servertype     "office365" | "personal-ms" - drives scope
+ *   onPopupOpened  optional observer for provider-driven reauth focus
+ *   onPopupClosed  optional observer for provider-driven reauth focus
  *
  * The OAuth client ID is read from the global `oauth.clientID` slot
  * (storage.local), with the hardcoded community ID as fallback. */
-export async function startAuth({ loginHint, servertype }) {
+export async function startAuth({
+  loginHint,
+  servertype,
+  onPopupOpened,
+  onPopupClosed,
+}) {
   const clientID = await getGlobalClientID();
   const scope = scopeForServertype(servertype);
   const state = crypto.randomUUID();
@@ -142,7 +149,10 @@ export async function startAuth({ loginHint, servertype }) {
   authUrl.searchParams.set("state", state);
   if (loginHint) authUrl.searchParams.set("login_hint", loginHint);
 
-  const responseUrl = await runConsentPopup(authUrl.toString());
+  const responseUrl = await runConsentPopup(authUrl.toString(), {
+    onPopupOpened,
+    onPopupClosed,
+  });
 
   // Parse the redirect URL - Microsoft echoes the code back as a query
   // string on the nativeclient page.
@@ -293,13 +303,21 @@ function decodeIdTokenEmail(idToken) {
  * ends up on once Microsoft redirects to the nativeclient endpoint.
  * Throws ERR.CANCELLED if the user closes the window first.
  */
-async function runConsentPopup(authUrl) {
+async function runConsentPopup(
+  authUrl,
+  { onPopupOpened, onPopupClosed } = {},
+) {
   const popup = await browser.windows.create({
     url: authUrl,
     type: "popup",
     width: 500,
     height: 750,
   });
+  try {
+    onPopupOpened?.(popup);
+  } catch (err) {
+    console.debug("[eas] OAuth onPopupOpened observer failed:", err);
+  }
 
   return new Promise((resolve, reject) => {
     let done = false;
@@ -307,6 +325,11 @@ async function runConsentPopup(authUrl) {
     const cleanup = () => {
       browser.tabs.onUpdated.removeListener(onUpdated);
       browser.windows.onRemoved.removeListener(onClosed);
+      try {
+        onPopupClosed?.(popup);
+      } catch (err) {
+        console.debug("[eas] OAuth onPopupClosed observer failed:", err);
+      }
     };
 
     const finish = (fn, value) => {

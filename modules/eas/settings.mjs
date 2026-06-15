@@ -29,6 +29,9 @@ import {
 import { readPath } from "./wbxml-helpers.mjs";
 
 const PROVISION_REQUIRED_STATUSES = new Set(["141", "142", "143", "144"]);
+export const SETTINGS_ERR = {
+  REJECTED: "E:SETTINGS_REJECTED",
+};
 
 // Matches legacy network.js:832-833 verbatim. `Model` is the device-class
 // label Exchange surfaces in its mobile-device list; `FriendlyName` is the
@@ -95,8 +98,10 @@ export async function sendDeviceInformation({ account, asVersion }) {
       message: `Settings rejected (Status=${status}); server demands re-Provision`,
     });
   }
-  throw withCode(
-    new Error(`Settings rejected (Status=${status ?? "missing"})`),
-    ERR.UNKNOWN_COMMAND,
-  );
+  const err = new Error(`Settings rejected (Status=${status ?? "missing"})`);
+  err.code = SETTINGS_ERR.REJECTED;
+  err.settingsStatus = status ?? null;
+  err.easCommand = "Settings";
+  err.easAsVersion = asVersion ?? null;
+  throw err;
 }

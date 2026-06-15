@@ -4,16 +4,15 @@
  * highest version present in both the server's list and our supported
  * set.
  *
- * Preference order is 14.1 → 16.1 → 14.0 → 2.5. 14.1 leads because the
- * contact / calendar codecs that we'll port from legacy are most reliably
- * tested against 14.1; 16.1 is a fallback for servers that no longer
- * advertise 14.1; the others are last-resort.
+ * Preference order is 16.1 -> 14.1 -> 14.0 -> 2.5. Office 365 needs 16.1
+ * for modern calendar exception handling; older servers can still fall
+ * back to the legacy-tested 14.x/2.5 paths.
  */
 
 import { ERR, withCode } from "../../vendor/tbsync/provider.mjs";
 import { easOptions } from "../network.mjs";
 
-const SUPPORTED = ["14.1", "16.1", "14.0", "2.5"];
+const SUPPORTED = ["16.1", "14.1", "14.0", "2.5"];
 
 export async function negotiateAsVersion({ account }) {
   const probe = await easOptions({ account });
